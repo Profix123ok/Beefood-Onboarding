@@ -199,8 +199,8 @@ body.theme-light .fiscal-chip{background:#f8fafc}
     </div>
     <button class="btn btn-sm" id="btnNewMain" onclick="onNewMain()">+ Novo</button>
     <button class="btn btn-sm btn-outline" id="btnAnalysts" onclick="openAnalystManager()" style="display:none">Analistas</button>
-    <button class="btn btn-sm btn-outline" onclick="syncToTeam()" title="Tentar sincronizar com Drive">↑ Drive</button>
-    <button class="btn btn-sm btn-outline" onclick="loadFromTeam()" title="Tentar carregar do Drive">↓ Drive</button>
+    <button class="btn btn-sm btn-outline" onclick="syncToTeam()" title="Sincronizar agora com a nuvem">↑ Drive</button>
+    <button class="btn btn-sm btn-outline" onclick="loadFromTeam()" title="Atualizar da nuvem">↓ Drive</button>
     <button class="btn btn-sm btn-success" onclick="exportTeamData()" title="Baixar JSON para compartilhar com a equipe">Exportar equipe</button>
     <label class="btn btn-sm btn-outline" style="cursor:pointer" title="Carregar JSON da equipe">Importar equipe<input type="file" accept="application/json" style="display:none" onchange="importTeamData(event)"/></label>
   </div>
@@ -237,11 +237,61 @@ body.theme-light .fiscal-chip{background:#f8fafc}
 </div>
 <div id="modal"></div>
 <div id="toast"></div>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script>
 
 const STORAGE_KEY='beefood_onboarding_v4';
 const ANALYSTS_KEY='beefood_analysts_v1';
-const DEFAULT_PASSWORD='beefood123';
+const FB_CONFIG={
+  apiKey:'AIzaSyBTkIyrqsHpIWuQYo6Caf_WAo41Ay24v4I',
+  authDomain:'beefood-onboarding.firebaseapp.com',
+  projectId:'beefood-onboarding',
+  storageBucket:'beefood-onboarding.firebasestorage.app',
+  messagingSenderId:'101623415864',
+  appId:'1:101623415864:web:152c30bfe49ab08b6912cd'
+};
+const FB_COLLECTIONS=['clients','agenda','scripts','casos','trainings','manualSessions','bitrixTemplates'];
+let fbReady=false, fbApplying=false, fbMetaDirty=false, fbEntering=false, fbSecondary=null, fbBootstrapInProgress=false;
+let fbDirty={}, fbRemote={}, fbInitialDone={}, fbAuditLogs=[], fbUnsubs=[];
+let fbAnalystsReady=false, fbMetaReady=false, fbFirstSyncDone=false;
+try{
+  if(window.firebase){
+    if(!firebase.apps.length) firebase.initializeApp(FB_CONFIG);
+    firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+  }
+}catch(e){ console.warn('Firebase init', e); }
+
+function analystEmail(nome){
+  const slug=String(nome||'').normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'.').replace(/^[.]+|[.]+$/g,'');
+  return (slug||'analista')+'@beefood-onboarding.firebaseapp.com';
+}
+function getSecondaryAuth(){
+  if(!window.firebase) return null;
+  if(!fbSecondary){
+    fbSecondary = firebase.apps.find(a=>a.name==='Secondary') || firebase.initializeApp(FB_CONFIG, 'Secondary');
+  }
+  return fbSecondary.auth();
+}
+function fbSanitize(obj){
+  try{ return JSON.parse(JSON.stringify(obj)); }catch(e){ return obj; }
+}
+function recKey(obj){
+  if(obj==null || typeof obj!=='object') return JSON.stringify(obj);
+  if(Array.isArray(obj)) return '['+obj.map(recKey).join(',')+']';
+  return '{'+Object.keys(obj).sort().map(k=>JSON.stringify(k)+':'+recKey(obj[k])).join(',')+'}';
+}
+function persistLocalOnly(){
+  const prev=fbApplying;
+  fbApplying=true;
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(data)); }catch(e){}
+  try{ if(typeof savePersonalData==='function') savePersonalData(); }catch(e){}
+  fbApplying=prev;
+}
+function teamRef(){
+  return firebase.firestore().collection('team').doc('main');
+}
 
 // Analistas iniciais
 let analysts = [
@@ -287,53 +337,95 @@ function showLogin(){
         <label style="font-size:.75rem;color:#94a3b8">Senha</label>
         <input id="loginSenha" type="password" style="width:100%;background:#0b1220;border:1px solid #1f2a3d;color:#e5e7eb;padding:8px;border-radius:6px" placeholder="Senha" />
       </div>
-      <button class="btn" style="width:100%;background:#3b82f6" onclick="doLogin()">Entrar</button>
-      <div style="font-size:.7rem;color:#64748b;margin-top:10px;text-align:center">Senha padrão de recuperação: beefood123</div>
+      <button class="btn" id="loginBtn" style="width:100%;background:#3b82f6" onclick="doLogin()">Entrar</button>
+      <div style="font-size:.7rem;color:#64748b;margin-top:10px;text-align:center">No primeiro acesso, use seu nome e defina a senha (mínimo 6 caracteres). Depois, um admin cadastra os demais analistas.</div>
     </div>`;
   overlay.style.display = 'flex';
+  const senhaEl=document.getElementById('loginSenha');
+  if(senhaEl){ senhaEl.addEventListener('keydown', ev=>{ if(ev.key==='Enter') doLogin(); }); }
+  const nomeEl=document.getElementById('loginNome');
+  if(nomeEl){ nomeEl.addEventListener('keydown', ev=>{ if(ev.key==='Enter'){ const s=document.getElementById('loginSenha'); if(s) s.focus(); } }); }
 }
 
-function doLogin(){
-  const nome = (document.getElementById('loginNome').value||'').trim();
-  const senha = document.getElementById('loginSenha').value||'';
+function authErrorMessage(err){
+  const code=err && err.code || '';
+  if(code==='auth/wrong-password' || code==='auth/invalid-credential' || code==='auth/invalid-login-credentials') return 'Senha incorreta';
+  if(code==='auth/user-not-found') return 'Analista não cadastrado. Peça para um admin cadastrar.';
+  if(code==='auth/weak-password') return 'A senha precisa ter ao menos 6 caracteres';
+  if(code==='auth/too-many-requests') return 'Muitas tentativas. Aguarde um momento e tente de novo.';
+  if(code==='auth/network-request-failed') return 'Sem conexão. Verifique a internet e tente de novo.';
+  if(code==='auth/email-already-in-use') return 'Senha incorreta';
+  return (err && err.message) ? 'Não foi possível entrar. Tente de novo.' : 'Não foi possível entrar.';
+}
+
+async function tryBootstrapAnalyst(user, nome){
+  const db=firebase.firestore();
+  const initRef=db.doc('team/main/meta/initialized');
+  const analystRef=db.doc('team/main/analysts/'+user.uid);
+  fbBootstrapInProgress=true;
+  try{
+    await db.runTransaction(async tx=>{
+      const initSnap=await tx.get(initRef);
+      if(initSnap.exists) throw new Error('already-initialized');
+      tx.set(analystRef,{
+        id:user.uid,
+        nome:nome,
+        isAdmin:true,
+        createdAt:new Date().toISOString(),
+        email:user.email||analystEmail(nome)
+      });
+      tx.set(initRef,{ at:new Date().toISOString(), by:user.uid, byNome:nome });
+    });
+    return true;
+  }catch(e){
+    return false;
+  }finally{
+    fbBootstrapInProgress=false;
+  }
+}
+
+async function doLogin(){
+  const nome=(document.getElementById('loginNome').value||'').trim();
+  const senha=document.getElementById('loginSenha').value||'';
   if(!nome || !senha){ alert('Preencha nome e senha'); return; }
-
-  let a = analysts.find(x => x.nome.toLowerCase() === nome.toLowerCase());
-  if(!a){
-    alert('Analista não encontrado. Peça para um Admin cadastrar.');
-    return;
-  }
-
-  const isDefault = senha === DEFAULT_PASSWORD;
-  const isLocal = a.senhaLocal && simpleHash(senha) === a.senhaLocal;
-
-  if(!isDefault && !isLocal){
-    alert('Senha incorreta');
-    return;
-  }
-
-  currentAnalyst = a;
-  localStorage.setItem('currentAnalystId', a.id);
-
-  if(isDefault && !a.senhaLocal){
-    // Primeiro acesso: pedir senha local
-    const nova = prompt('Primeiro acesso. Defina sua senha pessoal:');
-    if(nova && nova.trim()){
-      a.senhaLocal = simpleHash(nova.trim());
-      saveAnalysts();
-      showToast('Senha pessoal definida');
+  if(senha.length<6){ alert('A senha precisa ter ao menos 6 caracteres'); return; }
+  if(!window.firebase){ alert('Não foi possível conectar à nuvem. Recarregue a página.'); return; }
+  const btn=document.getElementById('loginBtn');
+  if(btn){ btn.disabled=true; btn.textContent='Entrando...'; }
+  const email=analystEmail(nome);
+  try{
+    try{
+      await firebase.auth().signInWithEmailAndPassword(email, senha);
+    }catch(e){
+      const code=e && e.code || '';
+      if(code==='auth/user-not-found' || code==='auth/invalid-credential' || code==='auth/invalid-login-credentials' || code==='auth/wrong-password'){
+        try{
+          const cred=await firebase.auth().createUserWithEmailAndPassword(email, senha);
+          const ok=await tryBootstrapAnalyst(cred.user, nome);
+          if(!ok){
+            try{ await cred.user.delete(); }catch(_){}
+            try{ await firebase.auth().signOut(); }catch(_){}
+            alert('Analista não cadastrado ou senha incorreta. Peça para um admin cadastrar.');
+            return;
+          }
+        }catch(e2){
+          if(e2 && e2.code==='auth/email-already-in-use'){
+            alert('Senha incorreta');
+            return;
+          }
+          throw e2;
+        }
+      }else{
+        throw e;
+      }
     }
+    // onAuthStateChanged chama enterApp
+  }catch(err){
+    console.warn(err);
+    alert(authErrorMessage(err));
+  }finally{
+    if(btn){ btn.disabled=false; btn.textContent='Entrar'; }
   }
-
-  document.getElementById('loginOverlay').style.display = 'none';
-  document.getElementById('app').style.display = '';
-  const btnA = document.getElementById('btnAnalysts');
-  if(btnA) btnA.style.display = currentAnalyst.isAdmin ? 'inline-flex' : 'none';
-  loadPersonalData();
-  // Carrega dados da equipe automaticamente ao entrar
-  setTimeout(()=>{ if(typeof loadFromTeam==='function') loadFromTeam().catch(()=>{}); }, 600);
-  renderSidebar();
-  if(currentTab==='dashboard') renderDashboard();
 }
 
 function loadPersonalData(){
@@ -343,15 +435,7 @@ function loadPersonalData(){
     const raw = localStorage.getItem(key);
     if(raw){
       const personal = JSON.parse(raw);
-      data.clients = personal.clients || [];
-      data.agenda = personal.agenda || [];
-      data.trainings = personal.trainings || [];
-      data.manualSessions = personal.manualSessions || [];
-    } else {
-      data.clients = [];
-      data.agenda = [];
-      data.trainings = [];
-      data.manualSessions = [];
+      if(personal.gamification) data.gamification = personal.gamification;
     }
   } catch(e){}
 }
@@ -359,31 +443,362 @@ function loadPersonalData(){
 function savePersonalData(){
   if(!currentAnalyst) return;
   const key = 'personal_' + currentAnalyst.id;
-  const personal = {
-    clients: data.clients || [],
-    agenda: data.agenda || [],
-    trainings: data.trainings || [],
-    manualSessions: data.manualSessions || []
-  };
-  try { localStorage.setItem(key, JSON.stringify(personal)); } catch(e){}
+  let prev={};
+  try { prev = JSON.parse(localStorage.getItem(key)||'{}')||{}; } catch(e){ prev={}; }
+  prev.gamification = data.gamification;
+  try { localStorage.setItem(key, JSON.stringify(prev)); } catch(e){}
 }
 
-// Auto-sync helpers
+// === SINCRONIZAÇÃO FIRESTORE ===
 let syncTimeout = null;
 function scheduleTeamSync(){
+  if(fbApplying || !fbReady || !currentAnalyst) return;
+  markSharedDirty();
   if(syncTimeout) clearTimeout(syncTimeout);
   syncTimeout = setTimeout(()=>{
-    if(currentAnalyst) syncToTeam().catch(()=>{});
-  }, 2500); // espera 2.5s após a última mudança
+    if(currentAnalyst) flushToCloud(false).catch(e=>console.warn(e));
+  }, 700);
 }
 
-// Sobrescreve save para agendar sync da equipe
-const _saveWithSync = save;
-save = function(){
-  _saveWithSync();
-  // Só agenda se a mudança for em dados da equipe
-  scheduleTeamSync();
-};
+function markSharedDirty(){
+  FB_COLLECTIONS.forEach(col=>{
+    const remote=fbRemote[col]||{};
+    (data[col]||[]).forEach(item=>{
+      if(!item) return;
+      if(!item.id) item.id=uid();
+      const prev=remote[item.id];
+      if(!prev || recKey(prev)!==recKey(item)){
+        fbDirty[col]=fbDirty[col]||{};
+        if(fbDirty[col][item.id]!=='delete') fbDirty[col][item.id]='upsert';
+      }
+    });
+    Object.keys(remote).forEach(id=>{
+      if(!(data[col]||[]).some(x=>x && x.id===id)){
+        fbDirty[col]=fbDirty[col]||{};
+        fbDirty[col][id]='delete';
+      }
+    });
+  });
+  const metaRemote=fbRemote._metaConfig;
+  const metaLocal={
+    scriptTagsManaged:data.scriptTagsManaged||[],
+    settings:{
+      finalIncluirFiscal:!!(data.settings&&data.settings.finalIncluirFiscal),
+      finalIncluirPosVenda:!!(data.settings&&data.settings.finalIncluirPosVenda)
+    }
+  };
+  if(!metaRemote || recKey(metaRemote.scriptTagsManaged||[])!==recKey(metaLocal.scriptTagsManaged) || recKey(metaRemote.settings||{})!==recKey(metaLocal.settings)){
+    fbMetaDirty=true;
+  }
+}
+
+async function addAudit(action, collection, recordId, title){
+  if(!window.firebase || !firebase.auth().currentUser) return;
+  const id=uid();
+  try{
+    await teamRef().collection('auditLogs').doc(id).set({
+      at:new Date().toISOString(),
+      by:firebase.auth().currentUser.uid,
+      byNome:(currentAnalyst && currentAnalyst.nome)||'',
+      action:action,
+      collection:collection||'',
+      recordId:recordId||'',
+      title:title||''
+    });
+  }catch(e){ console.warn('audit', e); }
+}
+
+async function flushToCloud(forceAll){
+  if(!window.firebase || !firebase.auth().currentUser || !currentAnalyst) return;
+  if(forceAll) markSharedDirty();
+  const team=teamRef();
+  const ops=[];
+  const audits=[];
+  FB_COLLECTIONS.forEach(col=>{
+    const dirty=fbDirty[col]||{};
+    Object.keys(dirty).forEach(id=>{
+      if(dirty[id]==='delete'){
+        ops.push({type:'delete', ref:team.collection(col).doc(id)});
+        const prev=(fbRemote[col]||{})[id];
+        audits.push({action:'delete', collection:col, recordId:id, title:(prev && (prev.nome||prev.titulo))||id});
+      }else{
+        const item=(data[col]||[]).find(x=>x && x.id===id);
+        if(!item) return;
+        const payload=fbSanitize(Object.assign({}, item, {
+          updatedAt:item.updatedAt||new Date().toISOString(),
+          updatedBy:currentAnalyst.nome
+        }));
+        ops.push({type:'set', ref:team.collection(col).doc(id), payload});
+        audits.push({action:'upsert', collection:col, recordId:id, title:item.nome||item.titulo||id});
+      }
+    });
+  });
+  if(fbMetaDirty || forceAll){
+    const payload=fbSanitize({
+      scriptTagsManaged:data.scriptTagsManaged||[],
+      settings:{
+        finalIncluirFiscal:!!(data.settings&&data.settings.finalIncluirFiscal),
+        finalIncluirPosVenda:!!(data.settings&&data.settings.finalIncluirPosVenda)
+      },
+      lastTeamSync:new Date().toISOString(),
+      updatedBy:currentAnalyst.nome
+    });
+    ops.push({type:'set', ref:team.collection('meta').doc('config'), payload});
+    fbMetaDirty=true;
+  }
+  if(!ops.length){
+    updateSyncStatus('Sincronizado', 'ok');
+    return;
+  }
+  updateSyncStatus('Sincronizando...', 'warn');
+  const CHUNK=400;
+  for(let i=0;i<ops.length;i+=CHUNK){
+    const batch=firebase.firestore().batch();
+    ops.slice(i,i+CHUNK).forEach(op=>{
+      if(op.type==='delete') batch.delete(op.ref);
+      else batch.set(op.ref, op.payload, {merge:true});
+    });
+    await batch.commit();
+  }
+  if(forceAll && audits.length>20){
+    await addAudit('sync','all','','Sincronização completa ('+audits.length+' itens)');
+  }else{
+    const byCol={};
+    audits.forEach(a=>{
+      const k=a.collection+'|'+(a.action==='delete'?'removeu':'atualizou');
+      if(!byCol[k]) byCol[k]={action:a.action, collection:a.collection, titles:[], n:0};
+      byCol[k].n++;
+      if(a.title && byCol[k].titles.length<3) byCol[k].titles.push(a.title);
+    });
+    for(const g of Object.values(byCol)){
+      const extra=g.n>g.titles.length ? ' +'+(g.n-g.titles.length) : '';
+      await addAudit(g.action, g.collection, '', (g.titles.join(', ')||g.collection)+extra);
+    }
+  }
+  fbDirty={};
+  fbMetaDirty=false;
+  data.lastTeamSync=new Date().toISOString();
+  persistLocalOnly();
+  updateSyncStatus('Sincronizado', 'ok');
+}
+
+function applyCollectionSnapshot(col, snap){
+  const remoteMap={};
+  snap.docs.forEach(d=>{ remoteMap[d.id]=Object.assign({id:d.id}, d.data()); });
+  fbRemote[col]=remoteMap;
+  fbInitialDone[col]=true;
+  const dirty=fbDirty[col]||{};
+  const localArr=data[col]||[];
+  const localMap={};
+  localArr.forEach(x=>{ if(x && x.id) localMap[x.id]=x; });
+  const merged=[];
+  const seen={};
+  Object.keys(remoteMap).forEach(id=>{
+    seen[id]=true;
+    if(dirty[id] && dirty[id]!=='delete' && localMap[id]) merged.push(localMap[id]);
+    else if(dirty[id]==='delete') return;
+    else merged.push(remoteMap[id]);
+  });
+  localArr.forEach(l=>{
+    if(!l || !l.id || seen[l.id]) return;
+    if(dirty[l.id] && dirty[l.id]!=='delete') merged.push(l);
+  });
+  data[col]=merged;
+  persistLocalOnly();
+  if(fbReady) refreshViewsIfNeeded();
+}
+
+function refreshViewsIfNeeded(){
+  const tag=(document.activeElement && document.activeElement.tagName||'').toLowerCase();
+  if(tag==='input'||tag==='textarea'||tag==='select'||(document.activeElement&&document.activeElement.isContentEditable)) return;
+  if(refreshViewsIfNeeded._t) clearTimeout(refreshViewsIfNeeded._t);
+  refreshViewsIfNeeded._t=setTimeout(()=>{
+    try{
+      if(typeof preserveScroll==='function'){
+        preserveScroll(()=>{
+          if(typeof renderSidebar==='function') renderSidebar();
+          if(currentTab==='dashboard' && typeof renderDashboard==='function') renderDashboard();
+        });
+      }else if(typeof renderSidebar==='function') renderSidebar();
+    }catch(e){}
+  }, 250);
+}
+
+function stopTeamListeners(){
+  fbUnsubs.forEach(u=>{ try{ u(); }catch(e){} });
+  fbUnsubs=[];
+}
+
+function startTeamListeners(){
+  stopTeamListeners();
+  FB_COLLECTIONS.forEach(c=>{ fbInitialDone[c]=false; });
+  fbAnalystsReady=false;
+  fbMetaReady=false;
+  const team=teamRef();
+  FB_COLLECTIONS.forEach(col=>{
+    const unsub=team.collection(col).onSnapshot(snap=>{
+      applyCollectionSnapshot(col, snap);
+    }, err=>{
+      console.warn(err);
+      updateSyncStatus('Erro na sincronização', 'warn');
+    });
+    fbUnsubs.push(unsub);
+  });
+  fbUnsubs.push(team.collection('analysts').onSnapshot(snap=>{
+    analysts=snap.docs.map(d=>Object.assign({id:d.id}, d.data()));
+    try{ localStorage.setItem(ANALYSTS_KEY, JSON.stringify(analysts.map(a=>({id:a.id,nome:a.nome,isAdmin:!!a.isAdmin,createdAt:a.createdAt||''})))); }catch(e){}
+    fbAnalystsReady=true;
+    const btnA=document.getElementById('btnAnalysts');
+    if(btnA && currentAnalyst) btnA.style.display=currentAnalyst.isAdmin?'inline-flex':'none';
+    const box=document.getElementById('analystManagerList');
+    if(box && typeof openAnalystManager==='function' && document.getElementById('newAnalystName')){
+      // lista viva no modal, se aberto — não reabre o modal inteiro
+    }
+  }, err=>console.warn(err)));
+  fbUnsubs.push(team.collection('meta').doc('config').onSnapshot(snap=>{
+    fbMetaReady=true;
+    if(!snap.exists){ fbRemote._metaConfig=null; return; }
+    const m=snap.data()||{};
+    fbRemote._metaConfig={ scriptTagsManaged:m.scriptTagsManaged||[], settings:m.settings||{} };
+    if(m.scriptTagsManaged) data.scriptTagsManaged=m.scriptTagsManaged;
+    if(m.settings && data.settings){
+      if(m.settings.finalIncluirFiscal!=null) data.settings.finalIncluirFiscal=m.settings.finalIncluirFiscal;
+      if(m.settings.finalIncluirPosVenda!=null) data.settings.finalIncluirPosVenda=m.settings.finalIncluirPosVenda;
+    }
+    if(m.lastTeamSync) data.lastTeamSync=m.lastTeamSync;
+    persistLocalOnly();
+  }, err=>{ fbMetaReady=true; console.warn(err); }));
+  fbUnsubs.push(team.collection('auditLogs').orderBy('at','desc').limit(80).onSnapshot(snap=>{
+    fbAuditLogs=snap.docs.map(d=>Object.assign({id:d.id}, d.data()));
+    const box=document.getElementById('auditLogList');
+    if(box) box.innerHTML=renderAuditList();
+  }, err=>console.warn(err)));
+}
+
+function waitFirstSnapshots(timeoutMs){
+  return new Promise(resolve=>{
+    const start=Date.now();
+    const tick=()=>{
+      const cols=FB_COLLECTIONS.every(c=>fbInitialDone[c]);
+      if((cols && fbAnalystsReady && fbMetaReady) || Date.now()-start>(timeoutMs||15000)) resolve();
+      else setTimeout(tick, 50);
+    };
+    tick();
+  });
+}
+
+function gatherLocalMigration(){
+  const mergeIn=(col, items)=>{
+    if(!items) return;
+    data[col]=data[col]||[];
+    items.forEach(item=>{
+      if(!item) return;
+      if(!item.id) item.id=uid();
+      if(!data[col].some(x=>x && x.id===item.id)) data[col].push(item);
+    });
+  };
+  Object.keys(localStorage).forEach(k=>{
+    if(k.indexOf('personal_')!==0) return;
+    try{
+      const p=JSON.parse(localStorage.getItem(k)||'{}')||{};
+      mergeIn('clients', p.clients);
+      mergeIn('agenda', p.agenda);
+      mergeIn('trainings', p.trainings);
+      mergeIn('manualSessions', p.manualSessions);
+    }catch(e){}
+  });
+}
+
+async function maybeMigrateToCloud(){
+  const empty=FB_COLLECTIONS.every(col=>!fbRemote[col] || !Object.keys(fbRemote[col]).length);
+  if(!empty) return false;
+  gatherLocalMigration();
+  (data.clients||[]).forEach(c=>{ try{ normalizeClient(c); }catch(e){} });
+  await flushToCloud(true);
+  return true;
+}
+
+async function loadAnalystDoc(uid, retries){
+  for(let i=0;i<(retries||20);i++){
+    try{
+      const snap=await firebase.firestore().doc('team/main/analysts/'+uid).get();
+      if(snap.exists) return Object.assign({id:snap.id}, snap.data());
+    }catch(e){ console.warn(e); }
+    if(!fbBootstrapInProgress && i>=12) break;
+    await new Promise(r=>setTimeout(r, 300));
+  }
+  return null;
+}
+
+async function enterApp(user){
+  if(fbEntering) return;
+  fbEntering=true;
+  updateSyncStatus('Conectando...', 'warn');
+  try{
+    const profile=await loadAnalystDoc(user.uid, 12);
+    if(!profile){
+      try{ await firebase.auth().signOut(); }catch(e){}
+      alert('Seu acesso não está cadastrado. Peça para um admin.');
+      showLogin();
+      return;
+    }
+    currentAnalyst=profile;
+    localStorage.setItem('currentAnalystId', currentAnalyst.id);
+    loadPersonalData();
+    const overlay=document.getElementById('loginOverlay');
+    if(overlay) overlay.style.display='none';
+    document.getElementById('app').style.display='';
+    const btnA=document.getElementById('btnAnalysts');
+    if(btnA) btnA.style.display=currentAnalyst.isAdmin?'inline-flex':'none';
+    startTeamListeners();
+    await waitFirstSnapshots(15000);
+    const migrated=await maybeMigrateToCloud();
+    try{
+      ensureWikiSeed();
+      ensureBitrixTemplates();
+      ensureDefaultScripts();
+      ensureGamification();
+      bootstrapXPFromData();
+    }catch(e){ console.warn(e); }
+    if(migrated) await flushToCloud(true);
+    else { markSharedDirty(); await flushToCloud(false); }
+    fbReady=true;
+    updateSyncStatus('Sincronizado', 'ok');
+    if(typeof renderSidebar==='function') renderSidebar();
+    if(currentTab==='dashboard' && typeof renderDashboard==='function') renderDashboard();
+    else if(typeof switchTab==='function') switchTab(currentTab||'dashboard');
+  }catch(e){
+    console.warn(e);
+    updateSyncStatus('Falha ao conectar', 'warn');
+    showToast('Não foi possível carregar os dados da nuvem agora.');
+  }finally{
+    fbEntering=false;
+  }
+}
+
+async function logoutAnalyst(){
+  fbReady=false;
+  stopTeamListeners();
+  currentAnalyst=null;
+  localStorage.removeItem('currentAnalystId');
+  try{ await firebase.auth().signOut(); }catch(e){}
+  const app=document.getElementById('app');
+  if(app) app.style.display='none';
+  showLogin();
+  showToast('Você saiu');
+}
+
+function renderAuditList(){
+  if(!fbAuditLogs.length) return '<p style="font-size:.8rem;color:var(--text-muted)">Nenhuma alteração registrada ainda.</p>';
+  const lab={upsert:'atualizou',delete:'removeu',sync:'sincronizou',create:'criou'};
+  return fbAuditLogs.map(a=>{
+    const who=escapeHtml(a.byNome||'alguém');
+    const act=lab[a.action]||a.action||'alterou';
+    const col=escapeHtml(a.collection||'');
+    const title=escapeHtml(a.title||'');
+    return `<div style="padding:6px 0;border-bottom:1px solid var(--border);font-size:.78rem"><strong>${who}</strong> ${act} <span style="color:var(--text-muted)">${col}</span>${title?' — '+title:''}<div style="color:var(--text-muted);font-size:.7rem">${fmt(a.at)}</div></div>`;
+  }).join('');
+}
 
 function openAnalystManager(){
   if(!currentAnalyst || !currentAnalyst.isAdmin){ showToast('Apenas Admin'); return; }
@@ -400,10 +815,12 @@ function openAnalystManager(){
       </div>
       <div class="form-group">
         <label>Novo analista</label>
-        <div style="display:flex;gap:6px">
-          <input id="newAnalystName" placeholder="Nome" style="flex:1" />
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <input id="newAnalystName" placeholder="Nome" style="flex:1;min-width:120px" />
+          <input id="newAnalystPass" type="password" placeholder="Senha inicial" style="flex:1;min-width:120px" />
           <button class="btn btn-sm btn-success" onclick="addAnalyst()">+</button>
         </div>
+        <p style="font-size:.7rem;color:var(--text-muted);margin-top:6px">A senha inicial precisa ter ao menos 6 caracteres.</p>
       </div>
       <div style="display:flex;justify-content:flex-end;margin-top:10px">
         <button class="btn btn-outline" onclick="closeModal()">Fechar</button>
@@ -411,70 +828,62 @@ function openAnalystManager(){
     </div>`;
 }
 
-function addAnalyst(){
-  const nome = (document.getElementById('newAnalystName').value||'').trim();
+async function addAnalyst(){
+  const nome=(document.getElementById('newAnalystName').value||'').trim();
+  const senha=(document.getElementById('newAnalystPass')&&document.getElementById('newAnalystPass').value)||'';
   if(!nome) return;
+  if(!senha || senha.length<6){ showToast('Informe uma senha inicial com ao menos 6 caracteres'); return; }
   if(analysts.some(a=>a.nome.toLowerCase()===nome.toLowerCase())){ showToast('Já existe'); return; }
-  analysts.push({ id: uid(), nome, senhaLocal: '', isAdmin: false, createdAt: new Date().toISOString() });
-  saveAnalysts();
-  openAnalystManager();
-  showToast('Analista adicionado');
+  try{
+    const secondary=getSecondaryAuth();
+    if(!secondary){ showToast('Nuvem indisponível'); return; }
+    const cred=await secondary.createUserWithEmailAndPassword(analystEmail(nome), senha);
+    await firebase.firestore().doc('team/main/analysts/'+cred.user.uid).set({
+      id:cred.user.uid,
+      nome,
+      isAdmin:false,
+      createdAt:new Date().toISOString(),
+      email:cred.user.email||analystEmail(nome)
+    });
+    try{ await secondary.signOut(); }catch(e){}
+    await addAudit('create','analysts', cred.user.uid, nome);
+    openAnalystManager();
+    showToast('Analista adicionado');
+  }catch(e){
+    console.warn(e);
+    if(e && e.code==='auth/email-already-in-use') showToast('Já existe um acesso com esse nome');
+    else if(e && e.code==='auth/weak-password') showToast('A senha precisa ter ao menos 6 caracteres');
+    else showToast('Não foi possível cadastrar o analista');
+  }
 }
 
-// === SYNC EQUIPE (Google Drive) ===
-const TEAM_FOLDER_NAME = 'BeeFood Onboarding Equipe';
-const TEAM_FILE_NAME = 'beefood_team_data.json';
-
-async function getOrCreateTeamFolder(){
-  // Search for folder
-  const search = await call_connected_tool({
-    tool_name: 'google_drive_search',
-    arguments: { exact_name: TEAM_FOLDER_NAME, mime_type_filter: 'application/vnd.google-apps.folder' }
-  });
-  if(search && search.files && search.files.length) return search.files[0].file_id;
-
-  // Create
-  const created = await call_connected_tool({
-    tool_name: 'google_drive_create_folder',
-    arguments: { folder_name: TEAM_FOLDER_NAME }
-  });
-  return created.id || created.file_id;
+async function removeAnalyst(id){
+  if(!currentAnalyst || !currentAnalyst.isAdmin){ showToast('Apenas Admin'); return; }
+  if(id===currentAnalyst.id){ showToast('Você não pode remover a si mesmo'); return; }
+  const alvo=analysts.find(a=>a.id===id);
+  if(!confirm('Remover '+(alvo&&alvo.nome?alvo.nome:'este analista')+'? A pessoa perde o acesso aos dados da equipe.')) return;
+  try{
+    await firebase.firestore().doc('team/main/analysts/'+id).delete();
+    await addAudit('delete','analysts', id, (alvo&&alvo.nome)||id);
+    openAnalystManager();
+    showToast('Analista removido');
+  }catch(e){
+    console.warn(e);
+    showToast('Não foi possível remover');
+  }
 }
 
 async function syncToTeam(){
   if(!currentAnalyst){ showToast('Faça login'); return; }
   updateSyncStatus('Sincronizando...', 'warn');
-  try {
-    if(typeof call_connected_tool !== 'function'){
-      throw new Error('Drive não disponível neste ambiente');
-    }
-    const folderId = await getOrCreateTeamFolder();
-    const teamData = {
-      version: 1,
-      updatedAt: new Date().toISOString(),
-      updatedBy: currentAnalyst.nome,
-      scripts: data.scripts || [],
-      casos: data.casos || [],
-      scriptTagsManaged: data.scriptTagsManaged || [],
-      analysts: analysts
-    };
-    await call_connected_tool({
-      tool_name: 'cursor__bridge___user-Google-drive-create_5ffile___17',
-      arguments: {
-        title: TEAM_FILE_NAME,
-        textContent: JSON.stringify(teamData, null, 2),
-        contentMimeType: 'application/json',
-        parentId: folderId
-      }
-    });
-    data.lastTeamSync = new Date().toISOString();
-    save();
+  try{
+    await flushToCloud(true);
     updateSyncStatus('Sincronizado', 'ok');
     showToast('Sincronizado com a equipe!');
-  } catch(e){
-    console.warn('Sync Drive falhou, use Exportar/Importar:', e);
-    updateSyncStatus('Use Exportar', 'warn');
-    showToast('Drive indisponível. Use o botão Exportar para compartilhar com a equipe.');
+  }catch(e){
+    console.warn(e);
+    updateSyncStatus('Falha ao sincronizar', 'warn');
+    showToast('Não foi possível sincronizar agora. Tente de novo.');
   }
 }
 
@@ -494,13 +903,17 @@ function updateSyncStatus(text, type){
 
 function exportTeamData(){
   const teamData = {
-    version: 1,
+    version: 2,
     updatedAt: new Date().toISOString(),
     updatedBy: currentAnalyst ? currentAnalyst.nome : 'desconhecido',
+    clients: data.clients || [],
+    agenda: data.agenda || [],
     scripts: data.scripts || [],
     casos: data.casos || [],
-    scriptTagsManaged: data.scriptTagsManaged || [],
-    analysts: analysts
+    trainings: data.trainings || [],
+    manualSessions: data.manualSessions || [],
+    bitrixTemplates: data.bitrixTemplates || [],
+    scriptTagsManaged: data.scriptTagsManaged || []
   };
   const blob = new Blob([JSON.stringify(teamData, null, 2)], {type:'application/json'});
   const a = document.createElement('a');
@@ -517,21 +930,16 @@ function importTeamData(ev){
   reader.onload = e => {
     try {
       const team = JSON.parse(e.target.result);
-      if(team.scripts) data.scripts = team.scripts;
-      if(team.casos) data.casos = team.casos;
+      ['clients','agenda','scripts','casos','trainings','manualSessions','bitrixTemplates'].forEach(col=>{
+        if(team[col]) data[col]=team[col];
+      });
+      if(team.clients) data.clients=team.clients.map(c=>{ try{ return normalizeClient(c); }catch(err){ return c; } });
       if(team.scriptTagsManaged) data.scriptTagsManaged = team.scriptTagsManaged;
-      if(team.analysts){
-        team.analysts.forEach(ta => {
-          if(!analysts.find(a=>a.id===ta.id || a.nome.toLowerCase()===ta.nome.toLowerCase())){
-            analysts.push(ta);
-          }
-        });
-        saveAnalysts();
-      }
       save();
+      if(typeof flushToCloud==='function') flushToCloud(true).catch(()=>{});
       showToast('Dados da equipe importados!');
-      renderScriptsHome();
-      renderSidebar();
+      if(typeof renderScriptsHome==='function') renderScriptsHome();
+      if(typeof renderSidebar==='function') renderSidebar();
     } catch(err){ showToast('Arquivo inválido'); }
   };
   reader.readAsText(file);
@@ -540,48 +948,35 @@ function importTeamData(ev){
 async function loadFromTeam(){
   if(!currentAnalyst){ showToast('Faça login'); return; }
   updateSyncStatus('Carregando...', 'warn');
-  try {
-    if(typeof call_connected_tool !== 'function'){
-      throw new Error('Drive não disponível');
+  try{
+    if(!window.firebase || !firebase.auth().currentUser) throw new Error('Sem sessão');
+    const team=teamRef();
+    for(const col of FB_COLLECTIONS){
+      const snap=await team.collection(col).get();
+      applyCollectionSnapshot(col, snap);
     }
-    const search = await call_connected_tool({
-      tool_name: 'google_drive_search',
-      arguments: { exact_name: TEAM_FILE_NAME, folder_name: TEAM_FOLDER_NAME }
-    });
-    if(!search || !search.files || !search.files.length){
-      updateSyncStatus('Sem dados', 'warn');
-      showToast('Nenhum dado da equipe no Drive ainda. Use Exportar.');
-      return;
+    const meta=await team.collection('meta').doc('config').get();
+    if(meta.exists){
+      const m=meta.data()||{};
+      if(m.scriptTagsManaged) data.scriptTagsManaged=m.scriptTagsManaged;
+      if(m.settings && data.settings){
+        if(m.settings.finalIncluirFiscal!=null) data.settings.finalIncluirFiscal=m.settings.finalIncluirFiscal;
+        if(m.settings.finalIncluirPosVenda!=null) data.settings.finalIncluirPosVenda=m.settings.finalIncluirPosVenda;
+      }
     }
-    const fileId = search.files[0].file_id;
-    await call_connected_tool({
-      tool_name: 'google_drive_download_artifact',
-      arguments: { file_id: fileId, dest_path: '/team_data.json' }
-    });
-    const content = await read_file({ file_path: '/workspace/artifacts/team_data.json' });
-    const team = JSON.parse(content);
-    if(team.scripts) data.scripts = team.scripts;
-    if(team.casos) data.casos = team.casos;
-    if(team.scriptTagsManaged) data.scriptTagsManaged = team.scriptTagsManaged;
-    if(team.analysts) {
-      team.analysts.forEach(ta => {
-        if(!analysts.find(a=>a.id===ta.id || a.nome.toLowerCase()===ta.nome.toLowerCase())){
-          analysts.push(ta);
-        }
-      });
-      saveAnalysts();
-    }
-    save();
+    persistLocalOnly();
     updateSyncStatus('Atualizado', 'ok');
     showToast('Dados da equipe carregados!');
-    renderScriptsHome();
-    renderSidebar();
-  } catch(e){
+    if(typeof renderScriptsHome==='function') renderScriptsHome();
+    if(typeof renderSidebar==='function') renderSidebar();
+    if(currentTab==='dashboard' && typeof renderDashboard==='function') renderDashboard();
+  }catch(e){
     console.warn(e);
-    updateSyncStatus('Use Importar', 'warn');
-    showToast('Drive indisponível. Use o botão Importar equipe.');
+    updateSyncStatus('Falha ao atualizar', 'warn');
+    showToast('Não foi possível atualizar agora. Tente de novo.');
   }
 }
+
 const PESSOAL_DEFAULT=['Verificar se o cliente acessou ao sistema','Verificar se enviou o formulário CRM','Verificar cadastro do cardápio','Perguntar se tem loja no iFood para clonar cardápio','Perguntar se já possui cardápio montado para clonar','Integrar apps que o cliente for utilizar','Configurar cardápio digital (capa, logo, WhatsApp)','Confirmar formas de pagamento','Configurar horário de abertura','Confirmar endereço e área de entrega','Configurar Fiscal (se utilizar)','Cadastrar mesas/comandas/funcionários (se utilizar)','Acesso remoto: baixar e configurar BeeFood 3.0 e impressoras'];
 const ROTEIRO_DEFAULT=['Verificar formulário inicial','Acessar e verificar banco de dados','Inserir links de cardápio digital no card','Preencher dados empresa (CNPJ, Razão Social, IE)','Chamar o cliente no chat'];
 const IMPL_DEFAULT=['Verificar usuários','Configuração do sistema no computador','Teste de impressão','Inserir logo','Verificar/ajustar telefone','Horários e fuso','Gerar ou apagar mesas/comandas','Integração POS Stone','Formas de recebimento presenciais','Formas de recebimento delivery','Áreas de atendimento','Integrações marketplace','Verificar fiscal','Confirmar cadastro de produtos','Confirmar data de início / go-live'];
@@ -656,7 +1051,7 @@ if(data.settings.theme==='light') document.body.classList.add('theme-light');
 
 
 function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
-function save(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}catch(e){showToast('Storage cheio?')}}
+function save(){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(data))}catch(e){showToast('Storage cheio?')}try{if(typeof savePersonalData==='function')savePersonalData()}catch(e){}if(!fbApplying && currentAnalyst && typeof scheduleTeamSync==='function') scheduleTeamSync();}
 function escapeHtml(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function fmt(iso){if(!iso)return '—';try{return new Date(iso).toLocaleString('pt-BR',{day:'2-digit',month:'2-digit',year:'2-digit',hour:'2-digit',minute:'2-digit'})}catch(e){return String(iso)}}
 function preserveScroll(fn){
@@ -784,27 +1179,21 @@ function bootstrapXPFromData(){ensureGamification();if(data.gamification.bootstr
 function ensureWikiSeed(){if(!data.casos)data.casos=[];const titles=new Set(data.casos.map(c=>(c.titulo||'').toLowerCase()));const now=new Date().toISOString();let added=0;WIKI_SEED.forEach(s=>{if(titles.has(s.titulo.toLowerCase()))return;data.casos.push({id:uid(),titulo:s.titulo,texto:s.texto,solucao:s.solucao,tags:(s.tags||[]).slice(),createdAt:now,updatedAt:now,seed:true});added++});if(added)save()}
 function ensureDefaultScripts(){
   if(!data.scripts) data.scripts=[];
-  const defaultMap = {};
-  DEFAULT_SCRIPTS.forEach(s => { defaultMap[s.titulo.toLowerCase()] = s; });
-  data.scripts = data.scripts.map(s => {
-    const key = (s.titulo||'').toLowerCase();
-    if(defaultMap[key]){
-      return { ...s, texto: defaultMap[key].texto, tags: (defaultMap[key].tags||[]).slice() };
-    }
-    return s;
-  });
   const existingTitles = new Set(data.scripts.map(s => (s.titulo||'').toLowerCase()));
+  let added=0;
   DEFAULT_SCRIPTS.forEach(s => {
     if(!existingTitles.has(s.titulo.toLowerCase())){
       data.scripts.push({ id: uid(), titulo: s.titulo, texto: s.texto, tags: (s.tags||[]).slice() });
+      existingTitles.add(s.titulo.toLowerCase());
+      added++;
     }
   });
-  save();
+  if(added) save();
 }
 function ensureBitrixTemplates(){if(!data.bitrixTemplates||!data.bitrixTemplates.length){data.bitrixTemplates=DEFAULT_BITRIX.map(t=>({id:t.id||uid(),titulo:t.titulo,texto:t.texto}));save()}}
 function needsWeeklyBackup(){if(!data.lastBackupAt)return true;return(Date.now()-new Date(data.lastBackupAt).getTime())>7*86400000}
 function exportData(){const payload={version:4,exportedAt:new Date().toISOString(),clients:data.clients,agenda:data.agenda,scripts:data.scripts,trainings:data.trainings,casos:data.casos,manualSessions:data.manualSessions,bitrixTemplates:data.bitrixTemplates,gamification:data.gamification,lastBackupAt:new Date().toISOString()};const blob=new Blob([JSON.stringify(payload,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='onboarding-backup-'+todayKey()+'.json';a.click();data.lastBackupAt=new Date().toISOString();save();showToast('Backup baixado')}
-function importData(ev){const f=ev.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const imp=JSON.parse(r.result);if(imp.clients)data.clients=imp.clients.map(normalizeClient);if(imp.scripts)data.scripts=imp.scripts;if(imp.trainings)data.trainings=imp.trainings;if(imp.casos)data.casos=imp.casos;if(imp.manualSessions)data.manualSessions=imp.manualSessions;if(imp.agenda)data.agenda=imp.agenda;if(imp.bitrixTemplates)data.bitrixTemplates=imp.bitrixTemplates;if(imp.gamification)data.gamification=imp.gamification;if(imp.lastBackupAt)data.lastBackupAt=imp.lastBackupAt;save();showToast('Importado');switchTab('clientes')}catch(e){showToast('JSON inválido')}};r.readAsText(f)}
+function importData(ev){const f=ev.target.files[0];if(!f)return;const r=new FileReader();r.onload=()=>{try{const imp=JSON.parse(r.result);if(imp.clients)data.clients=imp.clients.map(normalizeClient);if(imp.scripts)data.scripts=imp.scripts;if(imp.trainings)data.trainings=imp.trainings;if(imp.casos)data.casos=imp.casos;if(imp.manualSessions)data.manualSessions=imp.manualSessions;if(imp.agenda)data.agenda=imp.agenda;if(imp.bitrixTemplates)data.bitrixTemplates=imp.bitrixTemplates;if(imp.gamification)data.gamification=imp.gamification;if(imp.lastBackupAt)data.lastBackupAt=imp.lastBackupAt;save();if(typeof flushToCloud==='function')flushToCloud(true).catch(()=>{});showToast('Importado');switchTab('clientes')}catch(e){showToast('JSON inválido')}};r.readAsText(f)}
 
 
 function playDing(){
@@ -1914,7 +2303,7 @@ function renderManualHome(){
 }
 
 function renderConfig(){showDetail();document.getElementById('detailView').innerHTML=`<div class="main-header"><div class="main-header-info"><h2>Config</h2></div></div><div class="main-content">
-<div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Backup</span><span class="chevron">▶</span></div><div class="section-body open"><p style="font-size:.8rem;color:var(--text-muted);margin-bottom:8px">Último: ${fmt(data.lastBackupAt)} · A cada 7 dias o sistema avisa no painel Hoje e nos cards. O download só acontece quando você clicar em Exportar (nada é enviado para internet).</p><button class="btn btn-sm btn-success" onclick="exportData()">Exportar</button> <label class="btn btn-sm btn-outline" style="display:inline-flex;cursor:pointer">Importar<input type="file" accept="application/json" style="display:none" onchange="importData(event)"/></label> <button class="btn btn-sm btn-outline" onclick="ensureDefaultScripts();ensureWikiSeed();showToast('Mesclado')">Mesclar scripts/wiki</button></div></div>
+<div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Backup</span><span class="chevron">▶</span></div><div class="section-body open"><p style="font-size:.8rem;color:var(--text-muted);margin-bottom:8px">Último backup local: ${fmt(data.lastBackupAt)}. Os dados da equipe já sincronizam automaticamente na nuvem. O exportar continua disponível como cópia de segurança no seu computador. A cada 7 dias o sistema lembra do backup local.</p><button class="btn btn-sm btn-success" onclick="exportData()">Exportar</button> <label class="btn btn-sm btn-outline" style="display:inline-flex;cursor:pointer">Importar<input type="file" accept="application/json" style="display:none" onchange="importData(event)"/></label> <button class="btn btn-sm btn-outline" onclick="ensureDefaultScripts();ensureWikiSeed();showToast('Mesclado')">Mesclar scripts/wiki</button></div></div>
 <div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Bitrix</span><span class="chevron">▶</span></div><div class="section-body open">${(data.bitrixTemplates||[]).map((t,i)=>`<div style="margin-bottom:8px;padding:8px;border:1px solid var(--border);border-radius:8px"><input value="${escapeHtml(t.titulo)}" onchange="data.bitrixTemplates[${i}].titulo=this.value;save()" style="width:100%;margin-bottom:4px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px"/><textarea onchange="data.bitrixTemplates[${i}].texto=this.value;save()" style="width:100%;min-height:50px;background:#0f172a;border:1px solid var(--border);color:var(--text);border-radius:6px;padding:6px">${escapeHtml(t.texto)}</textarea></div>`).join('')}</div></div>
 <div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Notificações</span><span class="chevron">▶</span></div><div class="section-body open"><button class="btn btn-sm btn-outline" onclick="Notification.requestPermission().then(p=>showToast('Permissão: '+p))">Permitir</button></div></div>
 <div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Aparência e som</span><span class="chevron">▶</span></div><div class="section-body open">
@@ -1937,7 +2326,14 @@ function renderConfig(){showDetail();document.getElementById('detailView').inner
 <code>/</code> busca · <code>N</code> novo · <code>F</code> modo foco · <code>Esc</code> fechar<br>
 <code>1</code> Hoje · <code>2</code> Clientes · <code>3</code> Agenda · <code>4</code> Treino<br>
 <code>5</code> Scripts · <code>6</code> Wiki · <code>7</code> Carreira · <code>8</code> Config
-</div></div></div>`}
+</div></div>
+<div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Conta e sincronização</span><span class="chevron">▶</span></div><div class="section-body open" style="font-size:.82rem">
+<p style="color:var(--text-muted);margin-bottom:8px">Conectado como <strong>${escapeHtml((currentAnalyst&&currentAnalyst.nome)||'—')}</strong>${currentAnalyst&&currentAnalyst.isAdmin?' (admin)':''}. Última sincronização: ${fmt(data.lastTeamSync)}.</p>
+<button class="btn btn-sm btn-outline" onclick="syncToTeam()">Sincronizar agora</button>
+<button class="btn btn-sm btn-outline" onclick="logoutAnalyst()">Sair</button>
+</div></div>
+<div class="section-box"><div class="section-head open" onclick="toggleSection(this)"><span>Histórico de alterações</span><span class="chevron">▶</span></div><div class="section-body open" id="auditLogList">${typeof renderAuditList==='function'?renderAuditList():''}</div></div>
+</div>`}
 
 function checkAlerts(){const now=Date.now();(data.clients||[]).forEach(c=>{(c.alertas||[]).forEach(a=>{if(a.done||a._notified)return;const t=new Date(a.quando).getTime();if(t<=now&&t>now-120000){a._notified=true;try{if(Notification.permission==='granted')new Notification('Onboarding: '+c.nome,{body:a.texto,requireInteraction:true})}catch(e){}showToast('⏰ '+c.nome+': '+a.texto)}})});save()}
 setInterval(checkAlerts,30000);
@@ -1957,24 +2353,25 @@ document.addEventListener('keydown',function(ev){
 });
 
 
-try{ensureWikiSeed();ensureBitrixTemplates();ensureDefaultScripts();ensureGamification();bootstrapXPFromData()}catch(e){console.warn(e)}
-
-// Login
-const savedId = localStorage.getItem('currentAnalystId');
-if(savedId){
-  currentAnalyst = analysts.find(a=>a.id===savedId) || null;
-}
-if(!currentAnalyst){
-  showLogin();
-} else {
-  loadPersonalData();
-  const btnA = document.getElementById('btnAnalysts');
-  if(btnA) btnA.style.display = currentAnalyst.isAdmin ? 'inline-flex' : 'none';
-  setTimeout(()=>{ if(typeof loadFromTeam==='function') loadFromTeam().catch(()=>{}); }, 800);
+// Login e sincronização na nuvem
+document.getElementById('app').style.display='none';
+showLogin();
+if(window.firebase){
+  firebase.auth().onAuthStateChanged(user=>{
+    if(user) enterApp(user);
+    else {
+      fbReady=false;
+      currentAnalyst=null;
+      showLogin();
+    }
+  });
+}else{
+  const loginHint=document.querySelector('#loginOverlay div div:last-child');
+  showToast('Não foi possível carregar a nuvem. Recarregue a página.');
 }
 switchTab('dashboard');
 if(needsWeeklyBackup())setTimeout(()=>showToast('Lembrete: faça o backup semanal'),1500);
-console.log('Onboarding v4 ready');
+console.log('Onboarding v4 cloud ready');
 
 </script>
 </body>
